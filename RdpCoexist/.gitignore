@@ -1,0 +1,6 @@
+# Never commit the engine binary (upstream has no redistribution license) or runtime state.
+engine/
+logs/
+state.json
+*.exe
+*.dll
