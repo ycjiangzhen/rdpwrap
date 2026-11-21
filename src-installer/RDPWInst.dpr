@@ -12,6 +12,28 @@
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
   See the License for the specific language governing permissions and
   limitations under the License.
+
+  ---------------------------------------------------------------------------
+  Modified build - last updated 2026-11-21
+
+  Changes vs. upstream v2.6:
+    * Automatic privilege elevation on startup (RelaunchAsAdmin) - no more
+      manual "Run as administrator".
+    * Service stop/start uses "net stop / net start" commands (mirroring the
+      user's verified manual script): stop UmRdpService first, then
+      TermService; after writing INI start them in reverse order. All
+      commands use the /y switch so no interactive "Y/N" prompt is needed.
+    * WOW64 filesystem redirection is disabled on 64-bit Windows for the
+      entire run so net.exe / sc.exe are always found in real System32,
+      even though this is a 32-bit executable.
+    * GitINIFile sets 30-second connect/receive timeouts and checks every
+      InternetReadFile call for errors.
+    * Custom INI download URL is supported via the -url <url> switch;
+      without it the default Gitee mirror is used.
+    * CREATE_NO_WINDOW flag is used for child processes to avoid flashing
+      console windows during net stop / net start.
+    * Fixed resource leak in the INI write exception handler.
+  ---------------------------------------------------------------------------
 }
 
 program RDPWInst;
@@ -27,6 +49,7 @@ uses
   WinSvc,
   Registry,
   WinInet,
+  ShellAPI,
   AccCtrl,
   AclAPI;
 
@@ -78,9 +101,17 @@ type
   end;
   PENUM_SERVICE_STATUS_PROCESS = ^ENUM_SERVICE_STATUS_PROCESS;
 
+  // Minimal definition of TOKEN_ELEVATION so we do not depend on the version
+  // of the Windows unit shipped with older Delphi versions.
+  TTokenElevation = record
+    TokenIsElevated: DWORD;
+  end;
+
 const
   SC_ENUM_PROCESS_INFO = 0;
   TermService = 'TermService';
+  TokenElevationClass = 20; // TOKEN_INFORMATION_CLASS.TokenElevation
+
 var
   Installed: Boolean;
   Online: Boolean;
@@ -93,6 +124,13 @@ var
   TermServicePID: DWORD;
   ShareSvc: Array of String;
   sShareSvc: String;
+
+  // Custom INI download URL (set by the -url command line switch);
+  // empty means use the built-in default Gitee mirror.
+  CustomINIURL: String;
+
+const
+  DefaultINIURL = 'https://gitee.com/listme/rdpwrap.ini/raw/master/rdpwrap.ini';
 
 function SupportedArchitecture: Boolean;
 var
@@ -111,6 +149,61 @@ begin
       Result := True; // Intel/AMD x64
     end;
     else Result := False;
+  end;
+end;
+
+function IsAdmin: Boolean;
+var
+  hToken: THandle;
+  Elevation: TTokenElevation;
+  ReturnLength: DWORD;
+begin
+  Result := False;
+  if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, hToken) then
+  begin
+    if GetTokenInformation(hToken, TTokenInformationClass(TokenElevationClass),
+      @Elevation, SizeOf(Elevation), ReturnLength) then
+      Result := Elevation.TokenIsElevated <> 0;
+    CloseHandle(hToken);
+  end;
+end;
+
+procedure RelaunchAsAdmin;
+var
+  SEI: TShellExecuteInfo;
+  CmdLine: String;
+  I: Integer;
+begin
+  CmdLine := '';
+  for I := 1 to ParamCount do
+    if CmdLine = '' then
+      CmdLine := ParamStr(I)
+    else
+      CmdLine := CmdLine + ' ' + ParamStr(I);
+
+  ZeroMemory(@SEI, SizeOf(SEI));
+  SEI.cbSize := SizeOf(TShellExecuteInfo);
+  SEI.fMask := SEE_MASK_NOCLOSEPROCESS;
+  SEI.lpVerb := PWideChar('runas');
+  SEI.lpFile := PWideChar(ParamStr(0));
+  if CmdLine <> '' then
+    SEI.lpParameters := PWideChar(CmdLine)
+  else
+    SEI.lpParameters := nil;
+  SEI.lpDirectory := PWideChar(ExtractFilePath(ParamStr(0)));
+  SEI.nShow := SW_SHOWNORMAL;
+
+  if ShellExecuteEx(@SEI) then
+  begin
+    if SEI.hProcess <> 0 then
+      CloseHandle(SEI.hProcess);
+    Writeln('[+] Relaunched with administrator privileges.');
+  end
+  else
+  begin
+    Writeln('[-] Failed to request administrator privileges (code ',
+      GetLastError, ').');
+    Writeln('[*] Please run this program as administrator.');
   end;
 end;
 
@@ -286,12 +379,23 @@ begin
   CloseServiceHandle(hSC);
 end;
 
+procedure SvcStart(SvcName: String); forward;
+
+// ---------------------------------------------------------------------------
+// Service stop/start via net commands (mirrors the user's verified script)
+// ---------------------------------------------------------------------------
+
+procedure StopServicesByNet; forward;
+procedure StartServicesByNet; forward;
+
+// ---------------------------------------------------------------------------
+
 procedure SvcStart(SvcName: String);
 var
   hSC: SC_HANDLE;
-  hSvc: THandle;
+  hSvc: SC_HANDLE;
   Code: DWORD;
-  pch: PWideChar;
+  pch: PChar;
   procedure ExitError(Func: String; ErrorCode: DWORD);
   begin
     if hSC > 0 then
@@ -502,8 +606,11 @@ begin
   Result := False;
   ZeroMemory(@si, sizeof(si));
   si.cb := sizeof(si);
+  si.dwFlags := STARTF_USESHOWWINDOW;
+  si.wShowWindow := SW_HIDE;
   UniqueString(Cmdline);
-  if not CreateProcess(nil, PWideChar(Cmdline), nil, nil, True, 0, nil, nil, si, pi) then begin
+  if not CreateProcess(nil, PWideChar(Cmdline), nil, nil, True,
+    CREATE_NO_WINDOW, nil, nil, si, pi) then begin
     Writeln('[-] CreateProcess error (code: ', GetLastError, ').');
     Exit;
   end;
@@ -616,30 +723,63 @@ begin
 end;
 
 function GitINIFile(var Content: String): Boolean;
-const
-  URL = 'https://raw.githubusercontent.com/stascorp/rdpwrap/master/res/rdpwrap.ini';
 var
+  URL: String;
   NetHandle: HINTERNET;
   UrlHandle: HINTERNET;
   Str: String;
   Buf: Array[0..1023] of Byte;
   BytesRead: DWORD;
+  Timeout: DWORD;
 begin
   Result := False;
   Content := '';
-  NetHandle := InternetOpen('RDP Wrapper Update', INTERNET_OPEN_TYPE_PRECONFIG, nil, nil, 0);
+
+  if CustomINIURL <> '' then
+  begin
+    URL := CustomINIURL;
+    Writeln('[*] Using custom INI URL: ', URL);
+  end
+  else
+  begin
+    URL := DefaultINIURL;
+    Writeln('[*] Using default INI URL.');
+  end;
+  NetHandle := InternetOpen(PWideChar('RDP Wrapper Update'),
+    INTERNET_OPEN_TYPE_PRECONFIG, nil, nil, 0);
   if not Assigned(NetHandle) then
+  begin
+    Writeln('[-] InternetOpen error (code ', GetLastError, ').');
     Exit;
-  UrlHandle := InternetOpenUrl(NetHandle, PChar(URL), nil, 0, INTERNET_FLAG_RELOAD, 0);
+  end;
+
+  Timeout := 30000; // 30 seconds connect / receive timeout
+  InternetSetOption(NetHandle, INTERNET_OPTION_CONNECT_TIMEOUT,
+    @Timeout, SizeOf(Timeout));
+  InternetSetOption(NetHandle, INTERNET_OPTION_RECEIVE_TIMEOUT,
+    @Timeout, SizeOf(Timeout));
+
+  UrlHandle := InternetOpenUrl(NetHandle, PWideChar(URL), nil, 0,
+    INTERNET_FLAG_RELOAD, 0);
   if not Assigned(UrlHandle) then
   begin
+    Writeln('[-] InternetOpenUrl error (code ', GetLastError, ').');
     InternetCloseHandle(NetHandle);
     Exit;
   end;
   repeat
-    InternetReadFile(UrlHandle, @Buf[0], SizeOf(Buf), BytesRead);
-    SetString(Str, PAnsiChar(@Buf[0]), BytesRead);
-    Content := Content + Str;
+    if not InternetReadFile(UrlHandle, @Buf[0], SizeOf(Buf), BytesRead) then
+    begin
+      Writeln('[-] InternetReadFile error (code ', GetLastError, ').');
+      InternetCloseHandle(UrlHandle);
+      InternetCloseHandle(NetHandle);
+      Exit;
+    end;
+    if BytesRead > 0 then
+    begin
+      SetString(Str, PAnsiChar(@Buf[0]), BytesRead);
+      Content := Content + Str;
+    end;
   until BytesRead = 0;
   InternetCloseHandle(UrlHandle);
   InternetCloseHandle(NetHandle);
@@ -1047,6 +1187,7 @@ begin
       Str.LoadFromFile(Filename);
     except
       Writeln('[-] Failed to read INI file.');
+      Str.Free;
       Exit;
     end;
   end else
@@ -1056,6 +1197,7 @@ begin
       Break;
   if I >= Str.Count then begin
     Writeln('[-] Failed to check INI date.');
+    Str.Free;
     Exit;
   end;
   Content := StringReplace(Str[I], 'Updated=', '', []);
@@ -1070,10 +1212,88 @@ begin
   Result := True;
 end;
 
+// Stop services via net stop (mirrors the user's working script).
+// Order: stop dependent UmRdpService first, then TermService.
+procedure StopServicesByNet;
+var
+  SystemRoot: String;
+  CmdExe: String;
+begin
+  SystemRoot := GetEnvironmentVariable('SystemRoot');
+  if SystemRoot = '' then SystemRoot := 'C:\Windows';
+  CmdExe := SystemRoot + '\system32\cmd.exe';
+
+  Writeln('[*] Stopping dependent service UmRdpService (auto confirm)...');
+  ExecWait('"' + CmdExe + '" /c net stop UmRdpService /y');
+  Sleep(500);
+
+  Writeln('[*] Stopping TermService (auto confirm)...');
+  ExecWait('"' + CmdExe + '" /c net stop TermService /y');
+  Sleep(3000); // wait for file locks to release, as in user's manual script
+
+  Writeln('[+] Services stopped.');
+end;
+
+// Start services in reverse order: TermService first, then UmRdpService.
+procedure StartServicesByNet;
+var
+  SystemRoot: String;
+  CmdExe: String;
+begin
+  SystemRoot := GetEnvironmentVariable('SystemRoot');
+  if SystemRoot = '' then SystemRoot := 'C:\Windows';
+  CmdExe := SystemRoot + '\system32\cmd.exe';
+
+  Writeln('[*] Starting TermService...');
+  ExecWait('"' + CmdExe + '" /c net start TermService');
+  Sleep(500);
+
+  Writeln('[*] Starting UmRdpService...');
+  ExecWait('"' + CmdExe + '" /c net start UmRdpService');
+  Sleep(500);
+
+  Writeln('[+] Services started.');
+end;
+
+// Stop services, write the new INI, start services again.
+procedure RestartServiceAndWriteINI(Content, INIPath: String);
+var
+  Str: TStringList;
+  I: Integer;
+begin
+  Writeln('[*] Terminating service...');
+  AddPrivilege('SeDebugPrivilege');
+
+  StopServicesByNet;
+
+  if Length(ShareSvc) > 0 then
+    for I := 0 to Length(ShareSvc) - 1 do
+      SvcStart(ShareSvc[I]);
+  Sleep(500);
+
+  Writeln('[*] Writing INI file...');
+  Str := TStringList.Create;
+  try
+    Str.Text := Content;
+    try
+      Str.SaveToFile(INIPath);
+      Writeln('[+] INI file written -> ', INIPath);
+    except
+      Writeln('[-] Failed to write INI file.');
+      Str.Free;
+      StartServicesByNet;
+      Halt(ERROR_ACCESS_DENIED);
+    end;
+  finally
+    Str.Free;
+  end;
+
+  StartServicesByNet;
+end;
+
 procedure CheckUpdate;
 var
   INIPath, S: String;
-  Str: TStringList;
   I, OldDate, NewDate: Integer;
 begin
   INIPath := ExtractFilePath(ExpandPath(TermServicePath)) + 'rdpwrap.ini';
@@ -1083,7 +1303,7 @@ begin
     Format('%d.%.2d.%.2d', [OldDate div 10000, OldDate div 100 mod 100, OldDate mod 100]));
 
   if not GitINIFile(S) then begin
-    Writeln('[-] Failed to download latest INI from GitHub.');
+    Writeln('[-] Failed to download latest INI.');
     Halt(ERROR_ACCESS_DENIED);
   end;
   if not CheckINIDate('', S, NewDate) then
@@ -1099,27 +1319,7 @@ begin
 
       CheckTermsrvProcess;
 
-      Writeln('[*] Terminating service...');
-      AddPrivilege('SeDebugPrivilege');
-      KillProcess(TermServicePID);
-      Sleep(1000);
-
-      if Length(ShareSvc) > 0 then
-        for I := 0 to Length(ShareSvc) - 1 do
-          SvcStart(ShareSvc[I]);
-      Sleep(500);
-
-      Str := TStringList.Create;
-      Str.Text := S;
-      try
-        Str.SaveToFile(INIPath);
-      except
-        Writeln('[-] Failed to write INI file.');
-        Halt(ERROR_ACCESS_DENIED);
-      end;
-      Str.Free;
-
-      SvcStart(TermService);
+      RestartServiceAndWriteINI(S, INIPath);
 
       Writeln('[+] Update completed.');
     end else
@@ -1134,6 +1334,17 @@ begin
   Writeln('Copyright (C) Stas''M Corp. 2018');
   Writeln('');
 
+  // Scan command line for -url <url> switch (can appear anywhere after the action).
+  CustomINIURL := '';
+  for I := 1 to ParamCount do
+  begin
+    if (ParamStr(I) = '-url') and (I < ParamCount) then
+    begin
+      CustomINIURL := ParamStr(I + 1);
+      Break;
+    end;
+  end;
+
   if (ParamCount < 1)
   or (
     (ParamStr(1) <> '-l')
@@ -1144,7 +1355,7 @@ begin
   ) then
   begin
     Writeln('USAGE:');
-    Writeln('RDPWInst.exe [-l|-i[-s][-o]|-w|-u[-k]|-r]');
+    Writeln('RDPWInst.exe [-l|-i[-s][-o]|-w|-u[-k]|-r] [-url <url>]');
     Writeln('');
     Writeln('-l          display the license agreement');
     Writeln('-i          install wrapper to Program Files folder (default)');
@@ -1154,6 +1365,8 @@ begin
     Writeln('-u          uninstall wrapper');
     Writeln('-u -k       uninstall wrapper and keep settings');
     Writeln('-r          force restart Terminal Services');
+    Writeln('-url <url>  specify a custom download URL for the INI file');
+    Writeln('            (overrides the built-in default Gitee mirror)');
     Exit;
   end;
 
@@ -1170,6 +1383,16 @@ begin
     Exit;
   end;
 
+  // Everything apart from -l needs administrator rights. Request them
+  // automatically instead of asking the user to right-click "Run as admin".
+  if not IsAdmin then
+  begin
+    Writeln('[*] Administrator privileges are required.');
+    Writeln('[*] Requesting elevation...');
+    RelaunchAsAdmin;
+    Exit;
+  end;
+
   if not SupportedArchitecture then
   begin
     Writeln('[-] Unsupported processor architecture.');
@@ -1178,6 +1401,13 @@ begin
 
   CheckInstall;
 
+  // On 64-bit Windows, disable WOW64 filesystem redirection for the
+  // entire run so net.exe, cmd.exe, and System32 paths resolve correctly
+  // (without this, 32-bit exe gets redirected to SysWOW64 and cannot find
+  // the real 64-bit net.exe).  Always re-enable before exit.
+  if Arch = 64 then
+    DisableWowRedirection;
+  try
   if ParamStr(1) = '-i' then
   begin
     if Installed then
@@ -1198,9 +1428,6 @@ begin
     else
       WrapPath := '%ProgramFiles%\RDP Wrapper\rdpwrap.dll';
 
-    if Arch = 64 then
-      DisableWowRedirection;
-
     CheckTermsrvVersion;
     CheckTermsrvProcess;
 
@@ -1216,14 +1443,13 @@ begin
 
     Writeln('[*] Terminating service...');
     AddPrivilege('SeDebugPrivilege');
-    KillProcess(TermServicePID);
-    Sleep(1000);
+    StopServicesByNet;
 
     if Length(ShareSvc) > 0 then
       for I := 0 to Length(ShareSvc) - 1 do
         SvcStart(ShareSvc[I]);
     Sleep(500);
-    SvcStart(TermService);
+    StartServicesByNet;
     Sleep(500);
 
     Writeln('[*] Configuring registry...');
@@ -1232,9 +1458,6 @@ begin
     TSConfigFirewall(True);
 
     Writeln('[+] Successfully installed.');
-
-    if Arch = 64 then
-      RevertWowRedirection;
   end;
   if ParamStr(1) = '-u' then
   begin
@@ -1245,9 +1468,6 @@ begin
     end;
     Writeln('[*] Uninstalling...');
 
-    if Arch = 64 then
-      DisableWowRedirection;
-
     CheckTermsrvProcess;
 
     Writeln('[*] Resetting service library...');
@@ -1255,8 +1475,8 @@ begin
 
     Writeln('[*] Terminating service...');
     AddPrivilege('SeDebugPrivilege');
-    KillProcess(TermServicePID);
-    Sleep(1000);
+    StopServicesByNet;
+    Sleep(500);
 
     Writeln('[*] Removing files...');
     DeleteFiles;
@@ -1265,7 +1485,7 @@ begin
       for I := 0 to Length(ShareSvc) - 1 do
         SvcStart(ShareSvc[I]);
     Sleep(500);
-    SvcStart(TermService);
+    StartServicesByNet;
     Sleep(500);
 
     if ParamStr(2) <> '-k' then
@@ -1275,9 +1495,6 @@ begin
       Writeln('[*] Configuring firewall...');
       TSConfigFirewall(False);
     end;
-
-    if Arch = 64 then
-      RevertWowRedirection;
 
     Writeln('[+] Successfully uninstalled.');
   end;
@@ -1301,15 +1518,18 @@ begin
 
     Writeln('[*] Terminating service...');
     AddPrivilege('SeDebugPrivilege');
-    KillProcess(TermServicePID);
-    Sleep(1000);
+    StopServicesByNet;
 
     if Length(ShareSvc) > 0 then
       for I := 0 to Length(ShareSvc) - 1 do
         SvcStart(ShareSvc[I]);
     Sleep(500);
-    SvcStart(TermService);
+    StartServicesByNet;
 
     Writeln('[+] Done.');
+  end;
+  finally
+    if Arch = 64 then
+      RevertWowRedirection;
   end;
 end.
